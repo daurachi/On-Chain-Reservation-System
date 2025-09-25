@@ -158,6 +158,27 @@
   )
 )
 
+(define-public (reschedule-reservation (reservation-id uint) (new-reservation-time uint))
+  (let
+    (
+      (reservation (unwrap! (map-get? reservations { reservation-id: reservation-id }) err-reservation-not-found))
+      (restaurant (unwrap! (map-get? restaurants { restaurant-id: (get restaurant-id reservation) }) err-not-found))
+      (customer (get customer reservation))
+      (current-height stacks-block-height)
+      (cancellation-deadline (- (get reservation-time reservation) (get cancellation-window restaurant)))
+    )
+    (asserts! (is-eq tx-sender customer) err-unauthorized)
+    (asserts! (is-eq (get status reservation) "pending") err-reservation-confirmed)
+    (asserts! (<= current-height cancellation-deadline) err-too-late-to-cancel)
+    (asserts! (> new-reservation-time current-height) err-invalid-time)
+    (map-set reservations
+      { reservation-id: reservation-id }
+      (merge reservation { reservation-time: new-reservation-time })
+    )
+    (ok true)
+  )
+)
+
 (define-public (confirm-reservation (reservation-id uint))
   (let
     (
