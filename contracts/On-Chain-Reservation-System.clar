@@ -11,9 +11,14 @@
 (define-constant err-reservation-confirmed (err u107))
 (define-constant err-invalid-time (err u108))
 (define-constant err-restaurant-not-active (err u109))
+(define-constant err-waitlist-not-found (err u110))
+(define-constant err-already-on-waitlist (err u111))
+(define-constant err-waitlist-full (err u112))
+(define-constant err-not-on-waitlist (err u113))
 
 (define-data-var next-restaurant-id uint u1)
 (define-data-var next-reservation-id uint u1)
+(define-data-var next-waitlist-id uint u1)
 
 (define-map restaurants 
   { restaurant-id: uint }
@@ -49,6 +54,29 @@
 (define-map customer-reservations
   { customer: principal, restaurant-id: uint }
   { reservation-ids: (list 50 uint) }
+)
+
+(define-map waitlist-entries
+  { waitlist-id: uint }
+  {
+    restaurant-id: uint,
+    customer: principal,
+    desired-time: uint,
+    party-size: uint,
+    created-at: uint,
+    status: (string-ascii 20),
+    priority: uint
+  }
+)
+
+(define-map restaurant-waitlist
+  { restaurant-id: uint, desired-time: uint }
+  { waitlist-ids: (list 100 uint) }
+)
+
+(define-map customer-waitlist
+  { customer: principal }
+  { waitlist-ids: (list 20 uint) }
 )
 
 (define-public (register-restaurant (name (string-ascii 50)) (deposit-amount uint) (cancellation-window uint))
@@ -348,5 +376,211 @@
       is-active: (get is-active restaurant)
     })
     none
+  )
+)
+
+(define-public (join-waitlist (restaurant-id uint) (desired-time uint) (party-size uint))
+  (let
+    (
+      (restaurant (unwrap! (map-get? restaurants { restaurant-id: restaurant-id }) err-not-found))
+      (waitlist-id (var-get next-waitlist-id))
+      (current-height stacks-block-height)
+      (customer tx-sender)
+      (existing-waitlist (default-to (list) (get waitlist-ids (map-get? restaurant-waitlist { restaurant-id: restaurant-id, desired-time: desired-time }))))
+      (customer-entries (default-to (list) (get waitlist-ids (map-get? customer-waitlist { customer: customer }))))
+    )
+    (asserts! (get is-active restaurant) err-restaurant-not-active)
+    (asserts! (> desired-time current-height) err-invalid-time)
+    (asserts! (> party-size u0) err-invalid-time)
+    (asserts! (is-none (index-of existing-waitlist waitlist-id)) err-already-on-waitlist)
+    
+    (map-set waitlist-entries
+      { waitlist-id: waitlist-id }
+      {
+        restaurant-id: restaurant-id,
+        customer: customer,
+        desired-time: desired-time,
+        party-size: party-size,
+        created-at: current-height,
+        status: "active",
+        priority: (len existing-waitlist)
+      }
+    )
+    
+    (let
+      (
+        (updated-restaurant-waitlist (unwrap! (as-max-len? (append existing-waitlist waitlist-id) u100) err-waitlist-full))
+        (updated-customer-waitlist (unwrap! (as-max-len? (append customer-entries waitlist-id) u20) err-waitlist-full))
+      )
+      (map-set restaurant-waitlist
+        { restaurant-id: restaurant-id, desired-time: desired-time }
+        { waitlist-ids: updated-restaurant-waitlist }
+      )
+      
+      (map-set customer-waitlist
+        { customer: customer }
+        { waitlist-ids: updated-customer-waitlist }
+      )
+    )
+    
+    (var-set next-waitlist-id (+ waitlist-id u1))
+    (ok waitlist-id)
+  )
+)
+
+(define-public (leave-waitlist (waitlist-id uint))
+  (let
+    (
+      (entry (unwrap! (map-get? waitlist-entries { waitlist-id: waitlist-id }) err-waitlist-not-found))
+      (customer (get customer entry))
+    )
+    (asserts! (is-eq tx-sender customer) err-unauthorized)
+    (asserts! (is-eq (get status entry) "active") err-not-on-waitlist)
+    
+    (map-set waitlist-entries
+      { waitlist-id: waitlist-id }
+      (merge entry { status: "withdrawn" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (notify-from-waitlist (waitlist-id uint))
+  (let
+    (
+      (entry (unwrap! (map-get? waitlist-entries { waitlist-id: waitlist-id }) err-waitlist-not-found))
+      (restaurant (unwrap! (map-get? restaurants { restaurant-id: (get restaurant-id entry) }) err-not-found))
+      (restaurant-owner (get owner restaurant))
+    )
+    (asserts! (is-eq tx-sender restaurant-owner) err-unauthorized)
+    (asserts! (is-eq (get status entry) "active") err-not-on-waitlist)
+    
+    (map-set waitlist-entries
+      { waitlist-id: waitlist-id }
+      (merge entry { status: "notified" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (convert-waitlist-to-reservation (waitlist-id uint) (reservation-time uint))
+  (let
+    (
+      (entry (unwrap! (map-get? waitlist-entries { waitlist-id: waitlist-id }) err-waitlist-not-found))
+      (restaurant (unwrap! (map-get? restaurants { restaurant-id: (get restaurant-id entry) }) err-not-found))
+      (restaurant-owner (get owner restaurant))
+      (customer (get customer entry))
+      (reservation-id (var-get next-reservation-id))
+      (current-height stacks-block-height)
+      (deposit-amount (get deposit-amount restaurant))
+    )
+    (asserts! (is-eq tx-sender restaurant-owner) err-unauthorized)
+    (asserts! (is-eq (get status entry) "notified") err-not-on-waitlist)
+    (asserts! (> reservation-time current-height) err-invalid-time)
+    
+    (map-set waitlist-entries
+      { waitlist-id: waitlist-id }
+      (merge entry { status: "converted" })
+    )
+    
+    (map-set reservations
+      { reservation-id: reservation-id }
+      {
+        restaurant-id: (get restaurant-id entry),
+        customer: customer,
+        deposit-paid: u0,
+        reservation-time: reservation-time,
+        created-at: current-height,
+        status: "pending",
+        party-size: (get party-size entry)
+      }
+    )
+    
+    (let
+      (
+        (existing-reservations (default-to (list) (get reservation-ids (map-get? customer-reservations { customer: customer, restaurant-id: (get restaurant-id entry) }))))
+        (updated-reservations (unwrap! (as-max-len? (append existing-reservations reservation-id) u50) err-insufficient-funds))
+      )
+      (map-set customer-reservations
+        { customer: customer, restaurant-id: (get restaurant-id entry) }
+        { reservation-ids: updated-reservations }
+      )
+    )
+    
+    (map-set restaurants
+      { restaurant-id: (get restaurant-id entry) }
+      (merge restaurant { total-reservations: (+ (get total-reservations restaurant) u1) })
+    )
+    
+    (var-set next-reservation-id (+ reservation-id u1))
+    (ok reservation-id)
+  )
+)
+
+(define-read-only (get-waitlist-entry (waitlist-id uint))
+  (map-get? waitlist-entries { waitlist-id: waitlist-id })
+)
+
+(define-read-only (get-restaurant-waitlist (restaurant-id uint) (desired-time uint))
+  (map-get? restaurant-waitlist { restaurant-id: restaurant-id, desired-time: desired-time })
+)
+
+(define-read-only (get-customer-waitlist (customer principal))
+  (map-get? customer-waitlist { customer: customer })
+)
+
+(define-read-only (get-waitlist-position (waitlist-id uint))
+  (match (map-get? waitlist-entries { waitlist-id: waitlist-id })
+    entry (some (+ (get priority entry) u1))
+    none
+  )
+)
+
+(define-read-only (count-active-waitlist (restaurant-id uint) (desired-time uint))
+  (let
+    (
+      (waitlist-data (map-get? restaurant-waitlist { restaurant-id: restaurant-id, desired-time: desired-time }))
+    )
+    (match waitlist-data
+      data (len (get waitlist-ids data))
+      u0
+    )
+  )
+)
+
+(define-read-only (is-on-waitlist (customer principal) (restaurant-id uint) (desired-time uint))
+  (let
+    (
+      (waitlist-data (map-get? restaurant-waitlist { restaurant-id: restaurant-id, desired-time: desired-time }))
+      (customer-data (map-get? customer-waitlist { customer: customer }))
+    )
+    (match waitlist-data
+      restaurant-list (match customer-data
+        customer-list (let
+          (
+            (restaurant-ids (get waitlist-ids restaurant-list))
+            (customer-ids (get waitlist-ids customer-list))
+          )
+          (is-some (fold check-waitlist-match customer-ids none))
+        )
+        false
+      )
+      false
+    )
+  )
+)
+
+(define-private (check-waitlist-match (waitlist-id uint) (found (optional uint)))
+  (if (is-some found)
+    found
+    (match (map-get? waitlist-entries { waitlist-id: waitlist-id })
+      entry (if (is-eq (get status entry) "active")
+        (some waitlist-id)
+        none
+      )
+      none
+    )
   )
 )
